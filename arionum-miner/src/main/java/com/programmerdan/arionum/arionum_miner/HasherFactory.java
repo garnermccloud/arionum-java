@@ -40,7 +40,9 @@ public class HasherFactory {
 		case experimental:
 			return new MappedHasher(parent, id, lifeTime, maxSession);
 		case standard:
-			return new MappedHasher(parent, id, lifeTime, maxSession);
+			return new SafeMappedHasher(parent, id, lifeTime, maxSession);
+		case enhanced:
+			return new SafeMappedHasher(parent, id, lifeTime, maxSession);
 		case legacy:
 			return new ExperimentalHasher(parent, id, lifeTime, maxSession);
 		case gpu:

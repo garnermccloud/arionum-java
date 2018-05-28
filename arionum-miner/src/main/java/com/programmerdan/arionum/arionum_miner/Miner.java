@@ -40,6 +40,7 @@ import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -69,7 +70,7 @@ import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
 
 import com.programmerdan.arionum.arionum_miner.jna.*;
-
+import com.sun.jna.Memory;
 import com.diogonunes.jcdp.color.api.Ansi.Attribute;
 import com.diogonunes.jcdp.color.api.Ansi.FColor;
 import com.diogonunes.jcdp.color.api.Ansi.Attribute.*;
@@ -88,6 +89,9 @@ public class Miner implements UncaughtExceptionHandler {
 	public static final long UPDATING_DELAY = 2000l;
 	public static final long UPDATING_REPORT = 45000l;
 	public static final long UPDATING_STATS = 7500l;
+
+	public static boolean PERMIT_AFINITY = true;
+	public static boolean CHECK_BIND = true;
 	
 	private CPrint coPrint;
 	
@@ -117,7 +121,7 @@ public class Miner implements UncaughtExceptionHandler {
 	 * then we tune it based on observed results.
 	 */
 	private long hashesPerSession = 10l;
-	private static final long MIN_HASHES_PER_SESSION = 1l;
+	private static final long MIN_HASHES_PER_SESSION = 5l;
 	/**
 	 * The session length is the target parameter generally tuned against
 	 */
@@ -157,6 +161,8 @@ public class Miner implements UncaughtExceptionHandler {
 
 	protected final AtomicLong blockShares;
 	protected final AtomicLong blockFinds;
+	protected final AtomicLong shareRejects;
+	protected final AtomicLong findRejects;
 
 	/**
 	 * Let's thread off updating. We'll just hash constantly, and offload updating like submitting.
@@ -267,8 +273,12 @@ public class Miner implements UncaughtExceptionHandler {
 					String input = console.nextLine();
 
 					if ("y".equalsIgnoreCase(input)) {
-						System.out.print(" Choose type? (solo/pool) ");
+						String basetype = "pool";
+						System.out.print(" Choose type? (solo/pool - leave blank for default of pool) ");
 						String type = console.nextLine();
+						if (type == null || "".equals(type.trim())) {
+							type = basetype;
+						}
 						if ("solo".equalsIgnoreCase(type)) {
 							lines.add("solo");
 
@@ -489,6 +499,8 @@ public class Miner implements UncaughtExceptionHandler {
 
 		this.blockFinds = new AtomicLong();
 		this.blockShares = new AtomicLong();
+		this.findRejects = new AtomicLong();
+		this.shareRejects = new AtomicLong();
 
 		this.deadWorkerSummaries = new ConcurrentLinkedDeque<>();
 
@@ -596,14 +608,29 @@ public class Miner implements UncaughtExceptionHandler {
 			if (AdvMode.auto.equals(this.hasherMode)) {
 				this.maxHashers = -1;
 			}
+
+			char[] nameChar = worker.toCharArray();
+			// sanitize the worker name
+			StringBuilder nameSB = new StringBuilder(worker.length());
+			for (char ar : nameChar) {
+				if (ar >= '0' && ar <= '9' || ar >= 'a' && ar <= 'z' || ar >= 'A' && ar <= 'Z') {
+					nameSB.append(ar);
+				}
+			}
+			worker = nameSB.toString(); // sanitize...
 			
 			coPrint = new CPrint(colors);
+			coPrint.a(Attribute.BOLD).f(FColor.CYAN).ln("Running Version 0.2.5");
 			coPrint.a(Attribute.BOLD).f(FColor.CYAN).ln("Active config:")
 				.clr().f(FColor.CYAN).p("  type: ").f(FColor.GREEN).ln(this.type)
-				.clr().f(FColor.CYAN).p("  node: ").f(FColor.GREEN).ln(this.node)
-				.clr().f(FColor.CYAN).p("  public-key: ").f(FColor.GREEN).ln(this.publicKey)
-				.clr().f(FColor.CYAN).p("  private-key: ").f(FColor.GREEN).ln(this.privateKey)
-				.clr().f(FColor.CYAN).p("  hasher-count: ").f(FColor.GREEN).ln(this.maxHashers)
+				.clr().f(FColor.CYAN).p("  node: ").f(FColor.GREEN).ln(this.node);
+			if (MinerType.pool.equals(this.type)) {
+				coPrint.clr().f(FColor.CYAN).p("  wallet address: ").f(FColor.GREEN).ln(this.publicKey);
+			} else {
+				coPrint.clr().f(FColor.CYAN).p("  public-key: ").f(FColor.GREEN).ln(this.publicKey)
+					.clr().f(FColor.CYAN).p("  private-key: ").f(FColor.GREEN).ln(this.privateKey);
+			}
+			coPrint.clr().f(FColor.CYAN).p("  hasher-count: ").f(FColor.GREEN).ln(this.maxHashers)
 				.clr().f(FColor.CYAN).p("  hasher-mode: ").f(FColor.GREEN).ln(this.hasherMode)
 				.clr().f(FColor.CYAN).p("  colors: ").f(FColor.GREEN).ln(this.colors)
 			    .clr().f(FColor.CYAN).p("  worker-name: ").f(FColor.GREEN).ln(this.worker).clr();
@@ -649,6 +676,10 @@ public class Miner implements UncaughtExceptionHandler {
 		this.wallClockBegin = System.currentTimeMillis();
 	}
 
+	/**
+	 * Kicks off this whole hashing business.
+	 * 
+	 */
 	public void start() {
 		if (MinerType.test.equals(this.type)) {
 			startTest();
@@ -678,6 +709,10 @@ public class Miner implements UncaughtExceptionHandler {
 			profilesTested = 0;
 		}
 
+		if (isWindows()) {
+			disableRebindCheck();
+		}
+
 		active = true;
 		this.lastUpdate = wallClockBegin;
 		final AtomicBoolean firstRun = new AtomicBoolean(true);
@@ -690,7 +725,7 @@ public class Miner implements UncaughtExceptionHandler {
 		while (active) {
 			boolean updateLoop = true;
 			int firstAttempts = 0;
-			while (updateLoop) {
+			while (updateLoop) { // this allows us to handle initial update retries and general updates.
 				Future<Boolean> update = this.updaters.submit(new Callable<Boolean>() {
 					public Boolean call() {
 						long executionTimeTracker = System.currentTimeMillis();
@@ -819,7 +854,7 @@ public class Miner implements UncaughtExceptionHandler {
 										.info().p("  Failed: ").normData().fd(failures+skips)
 										.info().p("  Avg Update RTT: ").normData().fd((updates > 0 ? (updateTimeAvg.get() / (updates + failures)) : 0))
 											.unitLabel().p("ms").clr();
-								coPrint.ln().info().p("  Shares:  Attempted: ").normData().fd(sessionSubmits.get())
+								coPrint.ln().info().p("  Nonces:  Attempted: ").normData().fd(sessionSubmits.get())
 										.info().p("  Rejected: ").normData().fd(sessionRejects.get())
 										.info().p("  Eff: ").normData().fp("%.2f", (sessionSubmits.get() > 0 ? 100d * ((double) (sessionSubmits.get() - sessionRejects.get()) / (double)sessionSubmits.get()) : 100.0d ))
 											.unitLabel().p("%")
@@ -1057,6 +1092,7 @@ public class Miner implements UncaughtExceptionHandler {
 		}
 		return new long[]{this.hashesPerSession, (long) this.sessionLength * 2l};
 	}
+	
 	/**
 	 * Periodically we tally up reports from finished worker tasks
 	 */
@@ -1186,8 +1222,8 @@ public class Miner implements UncaughtExceptionHandler {
 			.p(" ").headers().fp("%8s", "Cur WL%").clr()
 			.p(" ").headers().fp("%8s", "Argon %").clr()
 			.p(" ").headers().fp("%8s", "Sha %").clr()
-			.p(" ").headers().fp("%7s", "Shares").clr()
-			.p(" ").headers().fp("%5s", "Finds").clr()
+			.p(" ").headers().fp("%7s", "Nonces").clr()
+			.p(" ").headers().fp("%5s", "Blocks").clr()
 			.p(" ").headers().fp("%6s", "Reject").clr();
 	}
 		
@@ -1199,8 +1235,8 @@ public class Miner implements UncaughtExceptionHandler {
 		double waitEff = 0.0d;
 		double argEff = 0.0d;
 		double shaEff = 0.0d;
-		long shares = this.blockShares.get();
-		long finds = this.blockFinds.get();
+		long shares = this.blockShares.get() - this.shareRejects.get();
+		long finds = this.blockFinds.get() - this.findRejects.get();
 		long failures = this.sessionRejects.get();
 		int grabReports = (int) (15000.0 / (double) (Miner.UPDATING_DELAY * 2d));
 		if (grabReports < 3) grabReports = 3;
@@ -1318,8 +1354,6 @@ public class Miner implements UncaughtExceptionHandler {
 						}
 					}
 
-					//System.out.println("Reporting submit: " + to.toString());
-					
 					URL url = new URL(to.toString());
 					HttpURLConnection con = (HttpURLConnection) url.openConnection();
 					if (post) {
@@ -1364,8 +1398,49 @@ public class Miner implements UncaughtExceptionHandler {
 			}
 		});
 	}
+
+	protected void reportFailure(final String packet, final String type) {
+		this.stats.submit( new Runnable() {
+			public void run() {
+				try {
+					StringBuilder to = new StringBuilder(statsHost);
+					to.append("/").append("reporterr.php");
+					to.append("?token=").append(URLEncoder.encode(statsToken, "UTF-8"));
+					to.append("&id=").append(URLEncoder.encode(worker, "UTF-8")).append("&type=").append(type);
+					
+					URL url = new URL(to.toString());
+					HttpURLConnection con = (HttpURLConnection) url.openConnection();
+
+					con.setRequestMethod("POST");
+					con.setRequestProperty("Content-type", "application/x-www-form-urlencoded");
+					con.setDoOutput(true);
+					DataOutputStream out = new DataOutputStream(con.getOutputStream());
+
+					StringBuilder data = new StringBuilder();
+
+					data.append(packet);
+					out.writeBytes(data.toString());
+						
+					out.flush();
+					out.close();
+				
+					int status = con.getResponseCode();
+					if (status != HttpURLConnection.HTTP_OK) {
+						// quietly fail..?
+						System.err.println("Failed to report error: " + status);
+					}
+				} catch (IOException ioe) {
+					// quietly fail.
+					System.err.println("Failed to report error: " + ioe.getMessage());
+				}
+			}
+		});
+	}
 	
-	protected void submit(final String nonce, final String argon, final long submitDL, final long difficulty, final String workerType, final long height) {
+	protected void submit(final String nonce, final String argon, final long submitDL, final long difficulty, final String workerType, final long height, final Hasher discover) {
+		final String sDiff = getDifficulty().toString();
+		final String sBlockId = getBlockData();
+		
 		this.submitters.submit(new Runnable() {
 			public void run() {
 
@@ -1382,12 +1457,14 @@ public class Miner implements UncaughtExceptionHandler {
 						con.setRequestProperty("Content-type", "application/x-www-form-urlencoded");
 						con.setDoOutput(true);
 						DataOutputStream out = new DataOutputStream(con.getOutputStream());
+						
+						String sentArgon = argon.substring(30);
 
 						StringBuilder data = new StringBuilder();
 
 						// argon, just the hash bit since params are universal
 						data.append(URLEncoder.encode("argon", "UTF-8")).append("=")
-								.append(URLEncoder.encode(argon.substring(30), "UTF-8")).append("&");
+								.append(URLEncoder.encode(sentArgon, "UTF-8")).append("&");
 						// nonce
 						data.append(URLEncoder.encode("nonce", "UTF-8")).append("=")
 								.append(URLEncoder.encode(nonce, "UTF-8")).append("&");
@@ -1410,7 +1487,7 @@ public class Miner implements UncaughtExceptionHandler {
 						coPrint.updateLabel().a(Attribute.LIGHT).p("Submitting to ").textData().fs(node).p(" ")
 							.updateLabel().a(Attribute.LIGHT).p(" a ").dlData().p(submitDL)
 							.updateLabel().a(Attribute.LIGHT).ln(" DL nonce.").p("  nonce: ").textData().p(nonce)
-							.updateLabel().a(Attribute.LIGHT).p(" argon: ").textData().ln(argon.substring(30)).clr();
+							.updateLabel().a(Attribute.LIGHT).p(" argon: ").textData().ln(sentArgon).clr();
 
 						out.flush();
 						out.close();
@@ -1433,6 +1510,12 @@ public class Miner implements UncaughtExceptionHandler {
 
 							if (!"ok".equals((String) obj.get("status"))) {
 								sessionRejects.incrementAndGet();
+								
+								if (submitDL <= 240) {
+									findRejects.incrementAndGet();
+								} else {
+									shareRejects.incrementAndGet();
+								}
 
 								coPrint.updateLabel().a(Attribute.LIGHT).p("Submit of ").textData().p(nonce).p(" ")
 									.clr().a(Attribute.BOLD).a(Attribute.UNDERLINE).f(FColor.RED).p("rejected")
@@ -1441,6 +1524,47 @@ public class Miner implements UncaughtExceptionHandler {
 								System.out.println(" Raw Failure: " + obj.toJSONString());
 								submitStats(nonce, argon, submitDL, difficulty, workerType, failures, false);
 
+								if (!"stale block".equalsIgnoreCase((String) obj.get("data"))) {
+									coPrint.updateMsg().p(" Triggering local check of submission validity: ");
+									
+									String base = publicKey + "-" + nonce + "-" + sBlockId + "-" + sDiff;
+									String argon2 = "$argon2i$v=19$m=524288,t=1,p=1" + URLDecoder.decode(URLEncoder.encode(sentArgon, "UTF-8"), "UTF-8");
+									byte[] baseBytes = base.getBytes();
+									
+									int ret = Argon2Library.INSTANCE.argon2i_verify(argon2.getBytes(), baseBytes, new Size_t(baseBytes.length));
+									if (ret == Argon2Library.ARGON2_OK) {
+										coPrint.f(FColor.RED).ln("VALID -- please report this to AroDev: ").clr();
+										coPrint.normData().p("  password_verify(\"").textData().p(base)
+											.normData().p("\",\"").textData().p(argon2).normData().ln("\");").clr();
+										if (MinerType.pool.equals(type)) {
+											coPrint.normData().p("  _POST Data: ").textData().ln(data.toString()).clr();
+										}
+										
+									} else {
+										coPrint.f(FColor.RED).ln("INVALID -- please report this to ProgrammerDan: ").clr();
+										coPrint.normData().p("  argon2i_verify(\"").textData().p(argon2)
+											.normData().p("\",\"").textData().p(base).normData().p("\",\"")
+											.textData().p(baseBytes.length).normData().p("\") = ")
+											.dlData().ln(ret);
+										coPrint.normData().p("  urlEncoded nonce: ").textData().ln(URLEncoder.encode(nonce, "UTF-8"));
+										coPrint.normData().p("  urlEncoded argon: ").textData().ln(URLEncoder.encode(sentArgon, "UTF-8")).clr();
+										if (MinerType.pool.equals(type)) {
+											coPrint.normData().p("  _POST Data: ").textData().ln(data.toString()).clr();
+										}
+										
+										discover.kill(); // this kills the hasher, throws away the memory page, and starts it over.
+									}
+									
+									if (statsHost != null) {
+										reportFailure(
+												"raw=" + URLEncoder.encode(data.toString(), "UTF-8") + "&verify=" + ret + "&base=" + URLEncoder.encode(base, "UTF-8")
+													+ "&baseLen=" + baseBytes.length + "&argon=" + URLEncoder.encode(argon2, "UTF-8"), workerType
+												);
+									}
+								} else {
+									coPrint.updateMsg().ln(" Rejection due to stale block -- regretably, work during block transition.").clr();
+								}
+								
 							} else {
 								coPrint.updateLabel().a(Attribute.LIGHT).p("Submit of ").textData().p(nonce)
 									.updateLabel().a(Attribute.LIGHT).ln(" confirmed!").clr();
@@ -1596,7 +1720,100 @@ public class Miner implements UncaughtExceptionHandler {
 		System.out.println("Utility Test on " + this.publicKey);
 		String refKey = this.publicKey;
 
-		// No tests at present.
+		// validation framework for error reports.
+		JnaUint32 iterations = new JnaUint32(1);
+		JnaUint32 memory = new JnaUint32(524288);
+		JnaUint32 parallelism = new JnaUint32(1);
+		JnaUint32 saltLenI = new JnaUint32(16);
+		JnaUint32 hashLenI = new JnaUint32(32);
+		Size_t saltLen = new Size_t(16l);
+		final Size_t hashLen = new Size_t(32l);
+		Argon2_type argonType = new Argon2_type(1l);
+		Argon2Library argonlib = Argon2Library.INSTANCE;
+		Size_t encLen = argonlib.argon2_encodedlen(iterations, memory, parallelism, saltLenI, hashLenI,
+				argonType);
+		byte[] encoded = new byte[encLen.intValue()];
+		/*String hashBase =  "PZ8Tyr4Nx8MHsRAGMpZmZ6TWY63dXWSCy7AEg3h9oYjeR74yj73q3gPxbxq9R3nxSSUV4KKgu1sQZu9Qj9v2q2HhT5H3LTHwW7HzAA28SjWFdzkNoovBMncD-JUdHXFcYVcIAChuZwCEAOKF8C9MFcWf6TF26dJnh5D-MtZvKY2VEbYzVJywaNJYxJb8TmFMV86Rg7Hovv5PnkrEWTYmz6B76TvrKBdCVvbFzHT4eWHhkrzY4WhxyCVo3PD-33037203" ; // put base here
+		String saltBase =  "Wmp4d0lpcUYvWVZza0hZLw" ; // put base64 salt here
+		String argon2iE =  "$argon2i$v=19$m=524288,t=1,p=1$Wmp4d0lpcUYvWVZza0hZLw$YhKKYUruDkVVdCVpFr6qJWBE4IfLNfvOvxAKvCGUcPc" ; // put expected argon2i here*/
+		/*String hashBase =  "PZ8Tyr4Nx8MHsRAGMpZmZ6TWY63dXWSCy7AEg3h9oYjeR74yj73q3gPxbxq9R3nxSSUV4KKgu1sQZu9Qj9v2q2HhT5H3LTHwW7HzAA28SjWFdzkNoovBMncD-OpcR797PK9DUEpJdSMSveFyUSdGc9BlR7YCtF5WLc-3zY6Pf5jXc1RQvHr8qYhow8YW1NYin3WS8N17HYM4wqrmtNeBQJbuFCoqHUwjodp9ZA7ycThvCHjsdQW3ffSukmV-65817790" ; // put base here
+		String saltBase =  "kORRUeHLjB3YiCEhKYuiDw" ; // put base64 salt here
+		String argon2iE =  "$argon2i$v=19$m=524288,t=1,p=1$kORRUeHLjB3YiCEhKYuiDw$uQ/unQvCQDBePyjknp8qrwOdu3XVvRzivjUE4x5Dp1M" ; // put expected argon2i here*/
+		/*String hashBase =  "PZ8Tyr4Nx8MHsRAGMpZmZ6TWY63dXWSCy7AEg3h9oYjeR74yj73q3gPxbxq9R3nxSSUV4KKgu1sQZu9Qj9v2q2HhT5H3LTHwW7HzAA28SjWFdzkNoovBMncD-IqAGeCJDeYEeAJEswJ5YBTE8RAKkaNE8kgKkkYL8oc8-4s2vXCw69f4rfobWmDgARK3SBDt1uGXYC8SpMyUpW6RrfLfn77v7vmeU8bZ79k54GEnNZtyCvWcLhgt16XxxG1qB-38578751" ; // put base here
+		String saltBase =  "DlqvSaKJvnb/Ec7aKnOoVQ" ; // put base64 salt here
+		String argon2iE =  "$argon2i$v=19$m=524288,t=1,p=1$DlqvSaKJvnb/Ec7aKnOoVQ$qCm/zbWj7oYAwkWeFTojrTTlaSxlwSmNELk4+KZ4EpY" ; // put expected argon2i here*/
+		String hashBase =  "PZ8Tyr4Nx8MHsRAGMpZmZ6TWY63dXWSCy7AEg3h9oYjeR74yj73q3gPxbxq9R3nxSSUV4KKgu1sQZu9Qj9v2q2HhT5H3LTHwW7HzAA28SjWFdzkNoovBMncD-A7tdOTOeAuvqmVtgH6YgVm83h0GWJ9vuMCYrtsE6pd-4XjCsnXntRfnskAyMST7AzzsPWCcXC7oxupE9qSMmmj7TkEyd1ZLYoonmMY57qEQqhP5uvksTh9gq8n22WpiVMoZ-24583881" ; // put base here
+		String saltBase =  "SFlCVUtSSXhac3Y5S09EVg" ; // put base64 salt here
+		String argon2iE =  "$argon2i$v=19$m=524288,t=1,p=1$SFlCVUtSSXhac3Y5S09EVg$WiGhW0/kYCNXSL3jeRxPIM+oD3Mhnm0S3PVbXUJwCzc" ; // put expected argon2i here
+		
+		
+		// now we process
+		System.out.println("Processing using Experimental Hasher method");
+		byte[] hashBaseBuffer = hashBase.getBytes();
+		Size_t hashBaseBufferSize = new Size_t(hashBaseBuffer.length);
+		byte[] salt = Base64.getDecoder().decode(saltBase);
+		
+		int res = argonlib.argon2i_hash_encoded(iterations, memory, parallelism, hashBaseBuffer, hashBaseBufferSize, salt,
+				saltLen, hashLen, encoded, encLen); // refactor saves like 30,000-200,000 ns per hash // 34.2 ms
+													// -- 34,200,000 ns
+		if (res != Argon2Library.ARGON2_OK) {
+			System.out.println("HASH FAILURE!" + res);
+		} else {
+			System.out.println("Expected Argon: " + argon2iE);
+			System.out.println("Generated Argon: " + new String(encoded));
+		}
+		
+		
+		System.out.println("Processing using Mapped Hasher method");
+		Argon2_Context context  = new Argon2_Context();
+		context.outlen = new JnaUint32(32);
+		context.out = new Memory(32l);
+		// assigned per hash context.pwdLen 
+		context.saltlen = new JnaUint32(16);
+		context.secret = null;
+		context.secretlen = new JnaUint32(0);
+		context.ad = null;
+		context.adlen = new JnaUint32(0);
+
+		context.t_cost = iterations;
+		context.m_cost = memory;
+		context.lanes = parallelism;
+		context.threads = parallelism;
+		context.flags = Argon2Library.ARGON2_DEFAULT_FLAGS;
+		context.version = new JnaUint32(0x13);
+		
+		Memory m_salt = new Memory(16l);
+		m_salt.write(0, salt, 0, 16);
+		
+		// set argon params in context..
+		context.out = new Memory(32l);
+		context.salt = m_salt;
+		context.pwdlen = new JnaUint32(hashBaseBuffer.length);
+		Memory m_hashBaseBuffer = new Memory(hashBaseBuffer.length);
+		m_hashBaseBuffer.write(0, hashBaseBuffer, 0, hashBaseBuffer.length);
+		context.pwd = m_hashBaseBuffer;
+
+		res = argonlib.argon2_ctx(context, argonType);
+		if (res != Argon2Library.ARGON2_OK) {
+			System.out.println("HASH FAILURE!" + res);
+		}
+		
+		encoded = new byte[encLen.intValue() - 1];
+		
+		int res2 = argonlib.encode_ctx(encoded, encLen, context, argonType);
+		if (res2 != Argon2Library.ARGON2_OK) {
+			System.out.println("ENCODE FAILURE! " + res2);
+		}
+		
+		if (encoded[encoded.length - 1] == 0) {
+			System.out.println("Encoded length failure.");
+		}
+		
+		else {
+			System.out.println("Expected Argon: " + argon2iE);
+			System.out.println("Generated Argon: " + new String(encoded));
+		}
+
 		
 		System.out.println("Done static testing.");
 	}
@@ -1610,5 +1827,19 @@ public class Miner implements UncaughtExceptionHandler {
 
 		System.err.println("\n\nThis is probably fatal, so exiting now.");
 		System.exit(1);
+	}
+	
+	public static void disableAffinity() {
+		Miner.PERMIT_AFINITY = false;
+	}
+
+	private static String OS = System.getProperty("os.name").toLowerCase();
+
+	public static boolean isWindows() {
+		return (OS.indexOf("win") >= 0);
+	}
+
+	public static void disableRebindCheck() {
+		Miner.CHECK_BIND = false;
 	}
 }

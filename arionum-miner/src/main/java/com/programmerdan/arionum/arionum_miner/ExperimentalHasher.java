@@ -53,6 +53,8 @@ import com.programmerdan.arionum.arionum_miner.jna.*;
  * 
  * Once a nonce is submitted, it is discarded and a new one generated, as the pool does not allow resubmission of prior nonces.
  * 
+ * This is deprecated; use MappedHasher instead.
+ * 
  * @author ProgrammerDan (Daniel Boston)
  *
  */
@@ -168,12 +170,14 @@ public class ExperimentalHasher extends Hasher {
 		long statEnd = 0l;
 
 		try {
-			boolean bound = true;
-			BitSet affinity = Affinity.getAffinity();
-			if (affinity == null || affinity.isEmpty() || affinity.cardinality() > 1) { // no affinity?
-				Integer lastChance = AggressiveAffinityThreadFactory.AffineMap.get(Affinity.getThreadId());
-				if (lastChance == null || lastChance < 0) {
-					bound = false;
+			boolean bound = Miner.PERMIT_AFINITY;
+			if (Miner.PERMIT_AFINITY) {
+				BitSet affinity = Affinity.getAffinity();
+				if (affinity == null || affinity.isEmpty() || affinity.cardinality() > 1) { // no affinity?
+					Integer lastChance = AggressiveAffinityThreadFactory.AffineMap.get(Affinity.getThreadId());
+					if (lastChance == null || lastChance < 0) {
+						bound = false;
+					}
 				}
 			}
 			while (doLoop && active) {
@@ -217,7 +221,7 @@ public class ExperimentalHasher extends Hasher {
 	
 					if (finalDuration > 0 && finalDuration <= this.limit) {
 	
-						parent.submit(rawNonce, new String(encoded), finalDuration, this.difficulty.longValue(), this.getType(), this.blockHeight);
+						parent.submit(rawNonce, new String(encoded), finalDuration, this.difficulty.longValue(), this.getType(), this.blockHeight, this);
 						if (finalDuration <= 240) {
 							finds++;
 						} else {
@@ -246,18 +250,20 @@ public class ExperimentalHasher extends Hasher {
 	
 				if (this.hashCount > this.targetHashCount || this.loopTime > this.maxTime) {
 					if (!bound) { // no affinity?
-						// make an attempt to grab affinity.
-						AffinityLock lock = AffinityLock.acquireLock(false); //myid);
-						if (!lock.isBound()) {
-							lock = AffinityLock.acquireLock();
-						}
-						if (!lock.isBound()) {
-							lock = AffinityLock.acquireCore();
-						}
-						if (!lock.isBound()) {
-							bound = false;
-						} else {
-							bound = true;
+						if (Miner.PERMIT_AFINITY) {
+							// make an attempt to grab affinity.
+							AffinityLock lock = AffinityLock.acquireLock(false); //myid);
+							if (!lock.isBound()) {
+								lock = AffinityLock.acquireLock();
+							}
+							if (!lock.isBound()) {
+								lock = AffinityLock.acquireCore();
+							}
+							if (!lock.isBound()) {
+								bound = false;
+							} else {
+								bound = true;
+							}
 						}
 					}
 					if (!bound) {
@@ -281,5 +287,9 @@ public class ExperimentalHasher extends Hasher {
 	
 	public String getType() {
 		return "Legacy";
+	}
+	
+	public void kill() {
+		active = false;
 	}
 }
